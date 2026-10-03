@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-title: "rocm-graph-train: making large HIP/CUDA graph capture work for recurrent training on AMD ROCm"
+title: "rocm-graph: making large HIP/CUDA graph capture work for launch-bound training on AMD ROCm"
 message: >-
   If you use this software in academic or other non-commercial work, please cite
   it. Commercial use requires a separate license.
@@ -12,7 +12,7 @@ authors:
 version: 0.0.1
 date-released: "2026-10-03"
 license: "PolyForm-Noncommercial-1.0.0"
-repository-code: "https://github.com/<your-username>/rocm-graph-train"   # TODO: after you create the repo
+repository-code: "https://github.com/ZhiqianYu/ROCM_Graph"
 abstract: >-
   A small toolkit and write-up for applying HIP/CUDA graph capture to
   launch-bound recurrent, autograd-based training on AMD ROCm, including a

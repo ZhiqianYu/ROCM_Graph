@@ -1,79 +1,103 @@
-# rocm-graph-train
+# rocm-graph
 
-**Making large HIP/CUDA-graph capture actually work for recurrent, autograd-based
-training on AMD ROCm.**
+**Make large HIP/CUDA graph capture work for launch-bound training on AMD ROCm.**
 
-> Status: **early / WIP.** This project is being built out of a concrete need:
-> training a recurrent, differentiable simulator (a spiking connectome-driven
-> controller) on an RX 7900 XT (gfx1100 / RDNA3), where the workload is
-> **launch-bound** (≈2,600 kernels/step, GPU only ~24% TDP) and the obvious fix —
-> graph capture — is blocked by ROCm bugs.
+> Status: **early / WIP** (`v0.0.1`). Born from a concrete need: training a
+> recurrent, differentiable simulator on an **RX 7900 XT (gfx1100 / RDNA3)** where
+> the workload is **launch-bound** (≈2.6k kernels/step, GPU ~24% TDP). Graph
+> capture — the standard cure — is blocked by ROCm bugs. This project collects the
+> workarounds, minimal reproducers, and the capture-safe building blocks.
+
+> **New here, or starting a fresh session?** Read **[`docs/HANDOFF.md`](docs/HANDOFF.md)**
+> first — it is the one-page entry point (mission, status, next steps, constraints).
+> Then see [Install](#install) and [`docs/TESTING.md`](docs/TESTING.md).
 
 ---
 
-## The problem
-
-Graph capture is the standard cure for launch-bound training/inference: record the
-stream once, replay the whole DAG with one launch. On AMD ROCm it breaks in three
-independent, reproducible ways:
+## 1. The problem: three reproducible ROCm HIP-graph blockers
 
 1. **`torch.sparse.mm` (rocsparse) is not capturable.**
-   `rocsparse_spmm`'s *preprocess* stage is not supported inside HIP graphs, so any
-   graph containing a sparse matmul fails to capture (`hipErrorStreamCaptureInvalidated`).
+   `rocsparse_spmm`'s *preprocess* stage is unsupported inside HIP graphs, so any
+   captured graph containing a sparse matmul fails (`hipErrorStreamCaptureInvalidated`).
 
-2. **Large graphs segfault on replay.**
-   HIP graph **capture + instantiation succeed**, but `hipGraphLaunch` (replay)
-   raises SIGSEGV inside `libamdhip64.so` above a graph-size threshold.
-   Minimal repro (no project code needed):
+2. **Large graphs SIGSEGV on replay.**
+   HIP graph **capture and `hipGraphInstantiate` succeed**, but `hipGraphLaunch`
+   (replay) crashes inside `libamdhip64.so` above a graph-size threshold. Minimal,
+   project-independent reproducer:
 
    ```bash
-   python repro/hip_graph_replay_segfault.py 2000   # SIGSEGV
-   python repro/hip_graph_replay_segfault.py 1000   # OK
+   python repro/hip_graph_replay_segfault.py 1000   # replay OK
+   python repro/hip_graph_replay_segfault.py 2000   # SIGSEGV (exit 139)
    ```
 
-   This is a **driver/runtime defect**, not a hardware limit: the command processor
-   handles ≥131072 packets, and `torch.compile(mode="reduce-overhead")` (which splits
-   into small subgraphs) runs the same workload fine.
+   This is a **driver/runtime defect, not a hardware limit** — the gfx1100 command
+   processor handles ≥131072 packets, and `torch.compile(mode="reduce-overhead")`
+   (which partitions into small subgraphs) runs the same workload fine.
    Related: [ROCm/hip#3887](https://github.com/ROCm/hip/issues/3887),
    [pytorch#155720](https://github.com/pytorch/pytorch/issues/155720).
 
 3. **`torch.compile(mode="reduce-overhead")` has no HIP guard.**
-   cudagraph trees silently mis-handle (or error on) recurrent state on ROCm —
-   see [pytorch#187715](https://github.com/pytorch/pytorch/issues/187715).
-   Naïvely applying it to a recurrent training loop raises
+   cudagraph trees silently mis-handle recurrent state on ROCm
+   ([pytorch#187715](https://github.com/pytorch/pytorch/issues/187715)):
    `accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run`.
 
-## What this project aims to provide
+## 2. What this project provides
 
-- **`segment_sum` SpMM** — a capture-safe replacement for `torch.sparse.mm`
-  (`F.embedding_bag` over a canonical-CSR-derived static structure). Semantically
-  equivalent, deterministic, graph-capturable.
-- **Device-cached constants** — a tiny helper so hot loops never build tensors from
-  Python lists (a hidden, non-obvious capture killer).
-- **Static-buffer recurrent training** — the refactor required to make captured
-  recurrent/autograd chunks correct (no address drift, no escaping tensors).
-- **Workarounds + minimal repros** for the ROCm HIP-graph bugs above.
-- **Benchmarks** (eager vs captured, wall-clock + numeric equivalence) on gfx1100.
+| Piece | File | Purpose |
+|---|---|---|
+| **capture-safe SpMM** | `src/rocgraph/segment_sum.py` | replaces `torch.sparse.mm` with an `F.embedding_bag` segment-sum (capturable + deterministic; ~1 ULP vs rocsparse, not bit-identical) |
+| **device-cached constants** | `src/rocgraph/const_cache.py` | kill the hidden pageable-H2D killer (`new_tensor([...])` in hot loops) |
+| **minimal reproducers** | `repro/` | prove the ROCm bugs without any project code |
+| **analysis + issue drafts** | `docs/` | hardware-vs-driver analysis, ready-to-file ROCm issue |
 
-The goal is a small, dependency-light toolkit + a write-up that lets anyone else on
-ROCm reproduce the problem and apply the fix.
+Planned (see [`docs/ROADMAP.md`](docs/ROADMAP.md)): static-buffer recurrent-training
+helper, cudagraph-trees integration, benchmarks on gfx1100.
 
-## Repository layout
+## 3. Install
 
-```text
-repro/        minimal, standalone reproducers for the ROCm bugs
-src/rocgraph/ the capture-safe pieces (SpMM, const-cache, capture helpers)
-docs/         the analysis, the ROCm issue draft, findings
+Requires an AMD GPU with ROCm and a matching PyTorch (`torch.cuda.is_available()`
+must be `True`; `torch.version.hip` set). See [`docs/INSTALL.md`](docs/INSTALL.md).
+
+```bash
+git clone https://github.com/ZhiqianYu/ROCM_Graph.git
+cd ROCM_Graph
+python -m venv .venv && source .venv/bin/activate
+pip install -e .
+# verify
+python -c "import torch, rocgraph; print(torch.__version__, torch.version.hip, rocgraph.__version__)"
 ```
 
-## License & citation
+## 4. Quickstart
 
-This project is **source-available** (not OSI "open source"):
+```python
+import torch
+from rocgraph import const_like, build_segment_sum_structure, segment_sum_spmm
 
-- **Personal, academic, and other non-commercial use: free**, but **you must cite**
-  this work (see [`CITATION.cff`](CITATION.cff)).
+# Device-cached constant (safe inside graph capture):
+base = torch.zeros(3, device="cuda")
+side = const_like(base, [-1.0, 1.0])
+
+# Capture-safe sparse matmul, y = W @ x:
+#   csr: a SciPy CSR matrix (canonical) describing W's topology
+#   values: (nnz,) non-zero values, in canonical row-major order
+struct = build_segment_sum_structure(csr, torch.device("cuda"))
+y = segment_sum_spmm(values, x, struct)          # (B, N)
+```
+
+## 5. Repository layout
+
+```text
+docs/         HANDOFF (start here) · INSTALL · TESTING · ROADMAP · analysis · issue draft
+src/rocgraph/ const_cache · segment_sum
+repro/        standalone ROCm bug reproducers
+tests/        smoke tests
+```
+
+## 6. License & citation
+
+**Source-available — not OSI "open source".** Governed by the
+[PolyForm Noncommercial License 1.0.0](LICENSE):
+
+- **Personal, academic, and other non-commercial use: free**, but you **must cite**
+  this work — see [`CITATION.cff`](CITATION.cff).
 - **Commercial use requires a separate license** from the copyright holder.
-- Governed by the **PolyForm Noncommercial License 1.0.0** ([`LICENSE`](LICENSE)).
-
-> ⚠️ Because commercial use is restricted, this is *not* an OSI-approved open-source
-> license. It is a **fair-source / source-available** license.
